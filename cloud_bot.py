@@ -2,30 +2,46 @@ import json
 import os
 import re
 import time
-import html
 import urllib.request
 import urllib.parse
 from pathlib import Path
 from bs4 import BeautifulSoup
 
-# --- CONFIGURATION ---
+# --- ENVIRONMENT SECRETS ---
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 
-SEEN_FILE = Path(__file__).parent / "seen_jobs.json"
+BASE_DIR = Path(__file__).parent
+SEEN_FILE = BASE_DIR / "seen_jobs.json"
+SEARCH_CONFIG_FILE = BASE_DIR / "search_config.json"
 
-SEARCH_QUERIES = [
-    {"keywords": "Stage Data Engineer", "location": "Paris"},
-    {"keywords": "Stage Machine Learning Engineer", "location": "Paris"},
-    {"keywords": "Stage AI Engineer", "location": "Paris"},
-    {"keywords": "Stage Data Engineer", "location": "La Défense"},
-]
+CONTRACT_TYPE_MAP = {
+    "internship": "I",   # Stage / Alternance
+    "full_time": "F",    # CDI / Temps plein
+    "contract": "C",     # CDD / Freelance / Contrat
+    "part_time": "P",    # Temps partiel
+    "temporary": "T",    # Intérim / Temporaire
+    "any": "",           # Tous types de contrats
+}
+
+TIME_WINDOW_MAP = {
+    "24h": "r86400",
+    "3d": "r259200",
+    "7d": "r604800",
+    "30d": "r2592000",
+}
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
 }
+
+
+def load_search_config():
+    if SEARCH_CONFIG_FILE.exists():
+        return json.loads(SEARCH_CONFIG_FILE.read_text(encoding="utf-8"))
+    raise FileNotFoundError(f"Missing configuration file: {SEARCH_CONFIG_FILE}")
 
 
 def load_seen():
@@ -62,19 +78,18 @@ def fetch_url(url, retries=3, backoff=4):
     return None
 
 
-def search_linkedin_jobs(keywords, location, time_filter="r86400"):
-    """
-    time_filter: r86400 (24h), r604800 (7d)
-    f_JT=I (Internship)
-    """
-    params = urllib.parse.urlencode({
+def search_linkedin_jobs(keywords, location, contract_code="I", time_filter="r604800"):
+    params_dict = {
         "keywords": keywords,
         "location": location,
         "f_TPR": time_filter,
-        "f_JT": "I",
         "sortBy": "DD",
         "start": 0,
-    })
+    }
+    if contract_code:
+        params_dict["f_JT"] = contract_code
+
+    params = urllib.parse.urlencode(params_dict)
     url = f"https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search?{params}"
     raw_html = fetch_url(url)
     if not raw_html:
@@ -126,28 +141,39 @@ def get_job_description(job_id):
     return desc_el.get_text(separator="\n", strip=True)
 
 
-def is_internship_offer(job, description):
+def matches_filters(job, description, cfg):
     title_lower = job["title"].lower()
     desc_lower = description.lower()
-    keywords_ok = any(k in title_lower or k in desc_lower for k in ["stage", "stagiaire", "intern", "internship"])
-    # Exclude obvious senior roles
-    senior_exclude = any(k in title_lower for k in ["senior", "lead", "directeur", "manager", "cdi"])
-    return keywords_ok and not senior_exclude
+
+    required = [k.lower() for k in cfg.get("required_keywords_in_offer", [])]
+    excluded = [k.lower() for k in cfg.get("excluded_keywords_in_title", [])]
+
+    if required:
+        keywords_ok = any(k in title_lower or k in desc_lower for k in required)
+    else:
+        keywords_ok = True
+
+    if excluded:
+        excluded_hit = any(k in title_lower for k in excluded)
+    else:
+        excluded_hit = False
+
+    return keywords_ok and not excluded_hit
 
 
-def summarize_with_gemini(job, description):
-    """Optional: if GEMINI_API_KEY is set, creates a clean summary and checks 10-week / summer compatibility."""
+def summarize_with_gemini(job, description, cfg):
     if not GEMINI_API_KEY or not description:
         short_desc = description[:700] + ("..." if len(description) > 700 else "")
         return short_desc if short_desc else "Description non disponible sur l'aperçu."
 
+    context = cfg.get("gemini_context", "un candidat recherchant des offres pertinentes")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
     prompt = (
-        f"Tu es un assistant qui résume des offres de stage pour un étudiant en 4ème année d'école d'ingénieur "
-        f"cherchant un stage de Data/ML/AI Engineer à Paris/La Défense d'environ 10 semaines (entre le 27 juin et le 15 septembre).\n"
+        f"Tu es un assistant carrière qui résume des offres d'emploi pour {context}.\n"
         f"Titre: {job['title']}\nEntreprise: {job['company']}\nLieu: {job['location']}\n"
         f"Description complète:\n{description[:4000]}\n\n"
-        f"Fais un résumé en français de 4-5 lignes maximum : missions principales, stack technique, et précise la durée/dates du stage si elles sont mentionnées."
+        f"Fais un résumé en français de 4-5 lignes maximum : missions principales, compétences/stack technique, "
+        f"et précise le type de contrat, la durée ou les dates si elles sont mentionnées."
     )
     payload = json.dumps({
         "contents": [{"parts": [{"text": prompt}]}]
@@ -179,41 +205,52 @@ def send_telegram_message(text):
 
 
 def main():
+    cfg = load_search_config()
     seen = load_seen()
     all_candidates = {}
 
-    # Search 7 days window to make sure we don't miss weekend/recent posts, deduplicated by seen_jobs.json
-    for q in SEARCH_QUERIES:
+    contract_code = CONTRACT_TYPE_MAP.get(cfg.get("contract_type", "internship"), "")
+    time_filter = TIME_WINDOW_MAP.get(cfg.get("time_window", "7d"), "r604800")
+    max_offers = int(cfg.get("max_offers_per_run", 10))
+
+    for q in cfg.get("queries", []):
         print(f"Searching: {q['keywords']} in {q['location']}...")
-        found = search_linkedin_jobs(q["keywords"], q["location"], time_filter="r604800")
+        found = search_linkedin_jobs(
+            q["keywords"],
+            q["location"],
+            contract_code=contract_code,
+            time_filter=time_filter,
+        )
         for job in found:
             if job["job_id"] not in seen and job["job_id"] not in all_candidates:
                 all_candidates[job["job_id"]] = job
-        time.sleep(3)  # Politeness delay to avoid LinkedIn 429
+        time.sleep(3)
 
     print(f"Found {len(all_candidates)} new candidate jobs.")
     new_offers_to_send = []
 
-    for job_id, job in list(all_candidates.items())[:10]:  # Process up to 10 new offers per day
+    for job_id, job in list(all_candidates.items())[:max_offers]:
         time.sleep(2)
         desc = get_job_description(job_id)
-        if is_internship_offer(job, desc):
-            summary = summarize_with_gemini(job, desc)
-            job["summary"] = summary
+        if matches_filters(job, desc, cfg):
+            job["summary"] = summarize_with_gemini(job, desc, cfg)
             new_offers_to_send.append(job)
-        # Mark as seen either way so we don't re-fetch non-matching offers tomorrow
         seen.add(job_id)
+
+    alert_title = cfg.get("alert_title", "NOUVELLE(S) OFFRE(S) D'EMPLOI")
+    sector_label = cfg.get("sector_label", "France")
+    target_label = cfg.get("target_label", "Toutes opportunités")
 
     if not new_offers_to_send:
         send_telegram_message(
-            "📭 Bonjour ! Aucune nouvelle offre de stage (Data / ML / AI Engineer à Paris & La Défense) "
-            "n'a été publiée depuis la dernière vérification."
+            f"📭 Bonjour ! Aucune nouvelle offre ({alert_title} - {sector_label}) "
+            f"n'a été publiée depuis la dernière vérification."
         )
     else:
         header = (
-            f"🎯 {len(new_offers_to_send)} NOUVELLE(S) OFFRE(S) DE STAGE (Data / ML / AI)\n"
-            f"📍 Secteur : Paris / La Défense & alentours\n"
-            f"🎓 Cible : Stage 4A Ingénieur (~10 sem., 27 juin - 15 sept.)\n"
+            f"🎯 {len(new_offers_to_send)} {alert_title}\n"
+            f"📍 Secteur : {sector_label}\n"
+            f"🎓 Cible : {target_label}\n"
         )
         send_telegram_message(header)
         for idx, offer in enumerate(new_offers_to_send, 1):

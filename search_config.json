@@ -1,0 +1,40 @@
+{
+  "alert_title": "NOUVELLE(S) OFFRE(S) DE STAGE (Data / ML / AI)",
+  "sector_label": "Paris / La Défense & alentours",
+  "target_label": "Stage 4A Ingénieur (~10 sem., 27 juin - 15 sept.)",
+  "contract_type": "internship",
+  "time_window": "7d",
+  "max_offers_per_run": 10,
+  "required_keywords_in_offer": [
+    "stage",
+    "stagiaire",
+    "intern",
+    "internship"
+  ],
+  "excluded_keywords_in_title": [
+    "senior",
+    "lead",
+    "directeur",
+    "manager",
+    "cdi"
+  ],
+  "queries": [
+    {
+      "keywords": "Stage Data Engineer",
+      "location": "Paris"
+    },
+    {
+      "keywords": "Stage Machine Learning Engineer",
+      "location": "Paris"
+    },
+    {
+      "keywords": "Stage AI Engineer",
+      "location": "Paris"
+    },
+    {
+      "keywords": "Stage Data Engineer",
+      "location": "La Défense"
+    }
+  ],
+  "gemini_context": "un étudiant en 4ème année d'école d'ingénieur cherchant un stage de Data/ML/AI Engineer à Paris ou La Défense d'environ 10 semaines (entre le 27 juin et le 15 septembre)"
+}
